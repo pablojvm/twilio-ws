@@ -104,7 +104,6 @@ async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
 
 // OpenAI: texto usuario -> texto respuesta
 async function getAIResponse(userText, state) {
-  // aquí puedes meter tu “estilo Lucía” y reglas de call center
   const system = `Eres Lucía, agente de soporte telefónico de Alerta y Control.
 Hablas en español, frases cortas, tono humano y profesional.
 Haz 1 pregunta por turno.
@@ -112,7 +111,6 @@ Si falta información, pregunta.
 Si es incidencia crítica, actúa con urgencia.
 No digas que eres IA.`;
 
-  // Estado mínimo (puedes ampliarlo y meter n8n)
   const context = `Estado:
 - Empleado: ${state.employeeName || "no identificado"}
 - Empresa: ${state.company || "desconocida"}
@@ -156,7 +154,6 @@ wss.on("connection", (twilioWs) => {
     lastFinalAt: 0
   };
 
-  // Deepgram live (Twilio manda mulaw 8k normalmente)
   const dg = deepgram.listen.live({
     model: "nova-2",
     language: "es",
@@ -181,7 +178,6 @@ wss.on("connection", (twilioWs) => {
     console.log("🟣 Deepgram Live cerrado");
   });
 
-  // Cuando Deepgram produce texto
   dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
     const alt = data.channel?.alternatives?.[0];
     const text = (alt?.transcript || "").trim();
@@ -191,17 +187,12 @@ wss.on("connection", (twilioWs) => {
       state.finalTextBuffer += (state.finalTextBuffer ? " " : "") + text;
       state.lastFinalAt = Date.now();
       console.log("✅ FINAL:", text);
-    } else {
-      // interim (no respondemos aún)
-      // console.log("… interim:", text);
     }
 
-    // Heurística simple de “fin de turno”
     const now = Date.now();
-    const endOfUtterance = data.speech_final || (state.finalTextBuffer && now - state.lastFinalAt > 700);
+    const endOfUtterance =
+      data.speech_final || (state.finalTextBuffer && now - state.lastFinalAt > 700);
 
-    // Si ya está hablando Lucía y el usuario vuelve a hablar -> barge-in: cortamos audio
-    // (esto no es perfecto pero ayuda)
     if (!data.is_final && state.isSpeaking && state.streamSid) {
       try {
         twilioWs.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
@@ -211,32 +202,46 @@ wss.on("connection", (twilioWs) => {
 
     if (!endOfUtterance || !state.finalTextBuffer) return;
 
-    // Cogemos el turno del usuario
     const userUtterance = state.finalTextBuffer;
     state.finalTextBuffer = "";
     console.log("🧠 TURNO USUARIO:", userUtterance);
 
-    // Evitar solapamiento de respuestas
     if (state.isSpeaking) return;
 
     state.isSpeaking = true;
+
+    // ✅ AQUI ESTÁ IMPLANTADO el try/catch nuevo (con logs por pasos)
     try {
-      // 1) IA -> texto
+      console.log("➡️ Llamando a OpenAI...");
       const aiText = await getAIResponse(userUtterance, state);
-      console.log("🤖 IA:", aiText);
+      console.log("✅ OpenAI OK:", aiText);
 
-      // 2) TTS -> mp3
+      console.log("➡️ Llamando a ElevenLabs...");
       const mp3 = await elevenlabsTTS(aiText);
+      console.log("✅ ElevenLabs OK, bytes:", mp3.length);
 
-      // 3) mp3 -> mulaw raw 8k
+      console.log("➡️ Transcodificando con ffmpeg...");
       const mulaw = await mp3ToMulaw8kRaw(mp3);
+      console.log("✅ ffmpeg OK, bytes:", mulaw.length);
 
-      // 4) reproducir en la llamada
+      console.log("➡️ Enviando audio a Twilio...");
       if (state.streamSid) {
         await playMulawToTwilio({ twilioWs, streamSid: state.streamSid, mulawRaw: mulaw });
+        console.log("✅ Audio enviado a Twilio");
+      } else {
+        throw new Error("No streamSid disponible para reproducir audio");
       }
+
     } catch (e) {
-      console.log("💥 Error respondiendo:", e?.message || e);
+      console.log("💥 Error respondiendo (mensaje):", e?.message || e);
+
+      if (e?.cause) {
+        console.log("💥 Cause:", e.cause);
+      }
+
+      if (e?.stack) {
+        console.log("💥 Stack:", e.stack.split("\n").slice(0, 6).join("\n"));
+      }
     } finally {
       state.isSpeaking = false;
     }
@@ -260,7 +265,6 @@ wss.on("connection", (twilioWs) => {
       const payload = data?.media?.payload;
       if (!payload) return;
 
-      // audio mulaw base64 -> buffer -> Deepgram
       const audio = Buffer.from(payload, "base64");
       dg.send(audio);
       return;
