@@ -14,7 +14,25 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ElevenLabs: texto -> mp3 buffer
+/**
+ * ✅ OpenAI TTS: texto -> MP3 buffer
+ * Model: gpt-4o-mini-tts
+ * Voice: alloy (puedes cambiar a otra voz si quieres)
+ */
+async function openaiTTS(text) {
+  const audio = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    format: "mp3",
+    input: text
+  });
+
+  const arrayBuf = await audio.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+/*
+// (Opcional) ElevenLabs: lo dejamos por si luego vuelves
 async function elevenlabsTTS(text) {
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   const apiKey = process.env.ELEVENLABS_API_KEY;
@@ -41,6 +59,7 @@ async function elevenlabsTTS(text) {
   const arrayBuf = await resp.arrayBuffer();
   return Buffer.from(arrayBuf);
 }
+*/
 
 // mp3 -> mulaw 8k (raw) buffer usando ffmpeg
 async function mp3ToMulaw8kRaw(mp3Buffer) {
@@ -92,12 +111,9 @@ async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
       media: { payload }
     };
 
-    // Si la conexión cae, salimos
     if (twilioWs.readyState !== 1) break;
 
     twilioWs.send(JSON.stringify(msg));
-
-    // pacing: 20ms por frame
     await sleep(20);
   }
 }
@@ -207,18 +223,17 @@ wss.on("connection", (twilioWs) => {
     console.log("🧠 TURNO USUARIO:", userUtterance);
 
     if (state.isSpeaking) return;
-
     state.isSpeaking = true;
 
-    // ✅ AQUI ESTÁ IMPLANTADO el try/catch nuevo (con logs por pasos)
     try {
       console.log("➡️ Llamando a OpenAI...");
       const aiText = await getAIResponse(userUtterance, state);
       console.log("✅ OpenAI OK:", aiText);
 
-      console.log("➡️ Llamando a ElevenLabs...");
-      const mp3 = await elevenlabsTTS(aiText);
-      console.log("✅ ElevenLabs OK, bytes:", mp3.length);
+      // ✅ AQUÍ: OpenAI TTS en vez de ElevenLabs
+      console.log("➡️ Llamando a OpenAI TTS...");
+      const mp3 = await openaiTTS(aiText);
+      console.log("✅ OpenAI TTS OK, bytes:", mp3.length);
 
       console.log("➡️ Transcodificando con ffmpeg...");
       const mulaw = await mp3ToMulaw8kRaw(mp3);
@@ -231,7 +246,6 @@ wss.on("connection", (twilioWs) => {
       } else {
         throw new Error("No streamSid disponible para reproducir audio");
       }
-
     } catch (e) {
       console.log("💥 Error respondiendo (mensaje):", e?.message || e);
 
