@@ -1,103 +1,288 @@
 import http from "http";
-import WebSocket from "ws";
-import { OpenAI } from "openai";  // O cualquier librería de IA que uses
-import fetch from "node-fetch";   // Para TTS
+import { WebSocketServer } from "ws";
+import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
+import OpenAI from "openai";
+import ffmpegPath from "ffmpeg-static";
+import { spawn } from "child_process";
 
-// Configuración OpenAI (por ejemplo, GPT)
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,  // Asegúrate de usar tu API Key
-});
+const PORT = process.env.PORT || 3000;
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ElevenLabs: texto -> mp3 buffer
+async function elevenlabsTTS(text) {
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+
+  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
+    method: "POST",
+    headers: {
+      "xi-api-key": apiKey,
+      "Content-Type": "application/json",
+      "Accept": "audio/mpeg"
+    },
+    body: JSON.stringify({
+      text,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: { stability: 0.4, similarity_boost: 0.75 }
+    })
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    throw new Error(`ElevenLabs error ${resp.status}: ${errText}`);
+  }
+
+  const arrayBuf = await resp.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+// mp3 -> mulaw 8k (raw) buffer usando ffmpeg
+async function mp3ToMulaw8kRaw(mp3Buffer) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", "pipe:0",
+      "-f", "mulaw",
+      "-ar", "8000",
+      "-ac", "1",
+      "pipe:1"
+    ]);
+
+    const chunks = [];
+    const errChunks = [];
+
+    ff.stdout.on("data", (d) => chunks.push(d));
+    ff.stderr.on("data", (d) => errChunks.push(d));
+
+    ff.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(errChunks).toString("utf8")}`));
+      } else {
+        resolve(Buffer.concat(chunks));
+      }
+    });
+
+    ff.on("error", reject);
+
+    ff.stdin.write(mp3Buffer);
+    ff.stdin.end();
+  });
+}
+
+// Enviar audio a Twilio por WS en frames de 20ms (160 bytes @8kHz mulaw)
+async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
+  const FRAME_BYTES = 160; // 20ms
+  let offset = 0;
+
+  while (offset < mulawRaw.length) {
+    const frame = mulawRaw.subarray(offset, offset + FRAME_BYTES);
+    offset += FRAME_BYTES;
+
+    const payload = frame.toString("base64");
+    const msg = {
+      event: "media",
+      streamSid,
+      media: { payload }
+    };
+
+    // Si la conexión cae, salimos
+    if (twilioWs.readyState !== 1) break;
+
+    twilioWs.send(JSON.stringify(msg));
+
+    // pacing: 20ms por frame
+    await sleep(20);
+  }
+}
+
+// OpenAI: texto usuario -> texto respuesta
+async function getAIResponse(userText, state) {
+  // aquí puedes meter tu “estilo Lucía” y reglas de call center
+  const system = `Eres Lucía, agente de soporte telefónico de Alerta y Control.
+Hablas en español, frases cortas, tono humano y profesional.
+Haz 1 pregunta por turno.
+Si falta información, pregunta.
+Si es incidencia crítica, actúa con urgencia.
+No digas que eres IA.`;
+
+  // Estado mínimo (puedes ampliarlo y meter n8n)
+  const context = `Estado:
+- Empleado: ${state.employeeName || "no identificado"}
+- Empresa: ${state.company || "desconocida"}
+`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: system },
+      { role: "system", content: context },
+      { role: "user", content: userText }
+    ]
+  });
+
+  return resp.choices?.[0]?.message?.content?.trim() || "Perdona, ¿me lo repites?";
+}
 
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("OK");
 });
 
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/ws-media") {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-wss.on("connection", (ws) => {
-  console.log("🟢 Twilio conectado al WS");
+wss.on("connection", (twilioWs) => {
+  console.log("🟢 Twilio conectado en /ws-media");
 
-  ws.on("message", async (msg) => {
-    const data = JSON.parse(msg.toString());
-    console.log("📩 Evento recibido:", data.event);
+  const state = {
+    streamSid: null,
+    isSpeaking: false,
+    finalTextBuffer: "",
+    lastFinalAt: 0
+  };
+
+  // Deepgram live (Twilio manda mulaw 8k normalmente)
+  const dg = deepgram.listen.live({
+    model: "nova-2",
+    language: "es",
+    smart_format: true,
+    encoding: "mulaw",
+    sample_rate: 8000,
+    channels: 1,
+    interim_results: true,
+    endpointing: 200,
+    vad_events: true
+  });
+
+  dg.on(LiveTranscriptionEvents.Open, () => {
+    console.log("🟣 Deepgram Live conectado");
+  });
+
+  dg.on(LiveTranscriptionEvents.Error, (e) => {
+    console.log("💥 Deepgram error:", e?.message || e);
+  });
+
+  dg.on(LiveTranscriptionEvents.Close, () => {
+    console.log("🟣 Deepgram Live cerrado");
+  });
+
+  // Cuando Deepgram produce texto
+  dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
+    const alt = data.channel?.alternatives?.[0];
+    const text = (alt?.transcript || "").trim();
+    if (!text) return;
+
+    if (data.is_final) {
+      state.finalTextBuffer += (state.finalTextBuffer ? " " : "") + text;
+      state.lastFinalAt = Date.now();
+      console.log("✅ FINAL:", text);
+    } else {
+      // interim (no respondemos aún)
+      // console.log("… interim:", text);
+    }
+
+    // Heurística simple de “fin de turno”
+    const now = Date.now();
+    const endOfUtterance = data.speech_final || (state.finalTextBuffer && now - state.lastFinalAt > 700);
+
+    // Si ya está hablando Lucía y el usuario vuelve a hablar -> barge-in: cortamos audio
+    // (esto no es perfecto pero ayuda)
+    if (!data.is_final && state.isSpeaking && state.streamSid) {
+      try {
+        twilioWs.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
+      } catch {}
+      state.isSpeaking = false;
+    }
+
+    if (!endOfUtterance || !state.finalTextBuffer) return;
+
+    // Cogemos el turno del usuario
+    const userUtterance = state.finalTextBuffer;
+    state.finalTextBuffer = "";
+    console.log("🧠 TURNO USUARIO:", userUtterance);
+
+    // Evitar solapamiento de respuestas
+    if (state.isSpeaking) return;
+
+    state.isSpeaking = true;
+    try {
+      // 1) IA -> texto
+      const aiText = await getAIResponse(userUtterance, state);
+      console.log("🤖 IA:", aiText);
+
+      // 2) TTS -> mp3
+      const mp3 = await elevenlabsTTS(aiText);
+
+      // 3) mp3 -> mulaw raw 8k
+      const mulaw = await mp3ToMulaw8kRaw(mp3);
+
+      // 4) reproducir en la llamada
+      if (state.streamSid) {
+        await playMulawToTwilio({ twilioWs, streamSid: state.streamSid, mulawRaw: mulaw });
+      }
+    } catch (e) {
+      console.log("💥 Error respondiendo:", e?.message || e);
+    } finally {
+      state.isSpeaking = false;
+    }
+  });
+
+  twilioWs.on("message", (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
 
     if (data.event === "start") {
-      console.log("📞 Stream iniciado:", data.start.streamSid);
+      state.streamSid = data?.start?.streamSid || null;
+      console.log("📞 start:", state.streamSid);
+      return;
     }
 
     if (data.event === "media") {
-      // Aquí procesas el audio recibido (STT)
-      const transcribedText = await convertAudioToText(data.media.payload);
+      const payload = data?.media?.payload;
+      if (!payload) return;
 
-      // Genera una respuesta usando IA (OpenAI, etc.)
-      const aiResponse = await getAIResponse(transcribedText);
-
-      // Envía la respuesta al usuario (TTS)
-      await sendTextToSpeech(aiResponse);
-
-      console.log("📩 Respuesta generada:", aiResponse);
+      // audio mulaw base64 -> buffer -> Deepgram
+      const audio = Buffer.from(payload, "base64");
+      dg.send(audio);
+      return;
     }
 
     if (data.event === "stop") {
-      console.log("🔴 Stream finalizado");
+      console.log("🔴 stop");
+      try { dg.finish(); } catch {}
+      return;
     }
   });
 
-  ws.on("close", () => console.log("❌ WS cerrado"));
+  twilioWs.on("close", () => {
+    console.log("❌ WS cerrado");
+    try { dg.finish(); } catch {}
+  });
+
+  twilioWs.on("error", (err) => {
+    console.log("💥 WS error:", err?.message || err);
+  });
 });
 
-// Start the server on the port
-server.listen(process.env.PORT || 3000, () => {
-  console.log("✅ Server up");
+server.listen(PORT, () => {
+  console.log("✅ Server up on", PORT);
 });
-
-// Función de STT (Speech to Text) - ejemplo
-async function convertAudioToText(audioBase64) {
-  const response = await fetch("https://api.deepgram.com/v1/listen", {
-    method: "POST",
-    headers: {
-      "Authorization": process.env.DEEPGRAM_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ audio: audioBase64 }),
-  });
-
-  const data = await response.json();
-  return data.transcript;  // O el formato adecuado según el servicio STT
-}
-
-// Función para generar una respuesta de IA (OpenAI)
-async function getAIResponse(inputText) {
-  const response = await openai.chat.completions.create({
-    model: "gpt-3.5-turbo",
-    messages: [{ role: "user", content: inputText }],
-  });
-
-  return response.choices[0].message.content; // Respuesta generada por IA
-}
-
-// Función para TTS (Text to Speech) - ejemplo
-async function sendTextToSpeech(text) {
-  const ttsResponse = await fetch("https://api.elevenlabs.io/synthesize", {
-    method: "POST",
-    headers: {
-      "Authorization": process.env.EVENLABS_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text: text, voice: "manuela" }),  // Puedes cambiar la voz
-  });
-
-  const audioData = await ttsResponse.json();
-  // Aquí, enviarías el audio de vuelta a Twilio para que se reproduzca
-}

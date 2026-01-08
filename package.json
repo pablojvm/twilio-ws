@@ -1,5 +1,5 @@
 {
-  "name": "twilio-ws",
+  "name": "twilio-ai-callcenter",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
@@ -7,7 +7,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@deepgram/sdk": "^4.11.3",
+    "ffmpeg-static": "^5.2.0",
+    "openai": "^4.0.0",
+    "ws": "^8.19.0"
   },
   "engines": {
     "node": ">=18"
