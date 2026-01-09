@@ -27,6 +27,49 @@ function looksLikeGoodbye(t = "") {
   );
 }
 
+function cleanEmployeeIdOrName(raw = "") {
+  let s = raw.trim().replace(/\s+/g, " ");
+
+  // quita prefijos típicos
+  s = s.replace(/^(yo\s+soy|soy|me\s+llamo|mi\s+nombre\s+es|nombre\s+es)\s+/i, "");
+  s = s.replace(
+    /^(n[uú]mero\s+de\s+empleado\s+es|n[uú]mero\s+empleado\s+es|mi\s+n[uú]mero\s+de\s+empleado\s+es)\s+/i,
+    ""
+  );
+
+  // quita signos al inicio/fin
+  s = s.replace(/^[\s:,-]+/, "").replace(/[\s:,-]+$/, "");
+
+  return s || raw.trim();
+}
+
+function looksLikeEmptyReason(raw = "") {
+  const s = raw.trim().toLowerCase();
+
+  const emptyPhrases = new Set([
+    "llamo porque",
+    "porque",
+    "pues",
+    "a ver",
+    "hola",
+    "sí",
+    "si",
+    "vale",
+    "ok",
+    "buenas",
+    "buenos días",
+    "buenas tardes",
+  ]);
+
+  if (!s) return true;
+  if (emptyPhrases.has(s)) return true;
+
+  const wordCount = s.split(/\s+/).filter(Boolean).length;
+  if (wordCount < 4) return true;
+
+  return false;
+}
+
 // ===== DEEPGRAM TTS (ESPAÑOL REAL) =====
 async function deepgramTTS(text) {
   const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-nestor-es";
@@ -36,9 +79,9 @@ async function deepgramTTS(text) {
     {
       method: "POST",
       headers: {
-        "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
+        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
         "Content-Type": "application/json",
-        "Accept": "audio/wav",
+        Accept: "audio/wav",
       },
       body: JSON.stringify({ text }),
     }
@@ -58,11 +101,16 @@ async function audioToMulaw8kRaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
       "-hide_banner",
-      "-loglevel", "error",
-      "-i", "pipe:0",
-      "-f", "mulaw",
-      "-ar", "8000",
-      "-ac", "1",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-f",
+      "mulaw",
+      "-ar",
+      "8000",
+      "-ac",
+      "1",
       "pipe:1",
     ]);
 
@@ -74,9 +122,7 @@ async function audioToMulaw8kRaw(inputBuffer) {
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(
-          new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`)
-        );
+        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`));
       } else {
         resolve(Buffer.concat(out));
       }
@@ -138,9 +184,13 @@ B) REASON: pedir el motivo (solo eso).
 C) DONE: cuando ya tienes motivo, crea incidencia, asigna departamento y prioridad, y CIERRA:
    1) Confirmación de ticket (muy breve)
    2) Frase final exacta:
-      "He creado la incidencia y la voy a mandar ahora mismo al departamento de {departamento}."
+      "He creado la incidencia y la voy a mandar ahora mismo al departamento de {departamento} para que un compañero la gestione."
    3) Despedida:
-      "Gracias por llamar. Cuando quieras, quedo a tu disposición. Hasta luego."
+      "Gracias por contactar con nosotros. Espero te lo solucionen lo antes posible. Hasta entonces, que pases un buen día."
+
+Regla extra:
+- Si el estado dice Identificado: sí, está PROHIBIDO volver a pedir nombre o número de empleado.
+- Si ya tienes motivo, está PROHIBIDO pedir más datos: solo clasifica y cierra.
 
 Departamentos posibles (elige 1):
 - nominas
@@ -173,6 +223,7 @@ Clasificación rápida:
   const context = `
 Estado:
 - etapa: ${state.stage}
+- Identificado: ${state.employeeIdOrName ? "sí" : "no"}
 - empleado: ${state.employeeIdOrName || "no informado"}
 - motivo: ${state.motivo || "no"}
 `;
@@ -214,7 +265,7 @@ wss.on("connection", (ws) => {
     lastFinal: 0,
 
     // estado callcenter
-    stage: "IDENTIFY", // IDENTIFY -> REASON -> DONE -> ACKED
+    stage: "IDENTIFY", // IDENTIFY -> REASON -> DONE
     employeeIdOrName: null,
     motivo: null,
     ackedGoodbye: false,
@@ -252,7 +303,7 @@ wss.on("connection", (ws) => {
     const userText = state.buffer;
     state.buffer = "";
 
-    // Si ya está DONE, NO volvemos a “gestionar” nada. Solo respondemos si el usuario se despide.
+    // DONE: silencio, solo contestar una despedida si procede
     if (state.stage === "DONE") {
       if (!state.ackedGoodbye && looksLikeGoodbye(userText)) {
         state.ackedGoodbye = true;
@@ -265,7 +316,7 @@ wss.on("connection", (ws) => {
           state.speaking = false;
         }
       }
-      return; // se queda “esperando” (silencio)
+      return;
     }
 
     state.speaking = true;
@@ -275,11 +326,11 @@ wss.on("connection", (ws) => {
 
       // ===== Máquina de estados =====
       if (state.stage === "IDENTIFY") {
-        state.employeeIdOrName = userText;
+        const clean = cleanEmployeeIdOrName(userText);
+        state.employeeIdOrName = clean;
         state.stage = "REASON";
         console.log("🪪 Identificación capturada:", state.employeeIdOrName);
 
-        // Aquí NO usamos OpenAI: preguntamos directo (más natural y cero bucles)
         const msg = `Perfecto, ${state.employeeIdOrName}. ¿Cuál es el motivo de tu llamada?`;
         console.log("🤖 VÍCTOR:", msg);
         await speak(ws, state, msg);
@@ -287,21 +338,28 @@ wss.on("connection", (ws) => {
       }
 
       if (state.stage === "REASON") {
+        // No aceptar motivos vacíos tipo “llamo porque”
+        if (looksLikeEmptyReason(userText)) {
+          const msg = "De acuerdo. Dime brevemente cuál es el problema.";
+          console.log("🤖 VÍCTOR:", msg);
+          await speak(ws, state, msg);
+          return;
+        }
+
         state.motivo = userText;
         console.log("📝 Motivo capturado:", state.motivo);
 
-        // Ahora sí: OpenAI crea ticket + departamento + frase final + despedida
         const aiText = await getAIResponse(userText, state);
         console.log("🤖 VÍCTOR:", aiText);
 
         await speak(ws, state, aiText);
 
-        // IMPORTANTE: pasamos a DONE para quedarnos en silencio después del cierre
+        // ya cerró -> silencio
         state.stage = "DONE";
         return;
       }
 
-      // fallback (por si algo raro)
+      // fallback
       const aiText = await getAIResponse(userText, state);
       console.log("🤖 VÍCTOR:", aiText);
       await speak(ws, state, aiText);
@@ -319,12 +377,11 @@ wss.on("connection", (ws) => {
       state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
 
-      // ✅ Saludo inicial: pide identificación
       if (!state.greeted && state.streamSid) {
         state.greeted = true;
 
         const greeting =
-          "Buenos días, soy Víctor, agente de Recursos Humanos. Antes de nada, dime tu nombre completo o tu número de empleado para identificarte.";
+          "Buenas, soy Víctor, agente de Recursos Humanos. Antes de nada, dime tu nombre completo o tu número de empleado para identificarte.";
 
         state.speaking = true;
         try {
