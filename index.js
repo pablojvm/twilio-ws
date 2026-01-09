@@ -15,54 +15,37 @@ function sleep(ms) {
 }
 
 /**
- * ✅ OpenAI TTS: texto -> MP3 buffer
- * Model: gpt-4o-mini-tts
- * Voice: alloy (puedes cambiar a otra voz si quieres)
+ * ✅ Deepgram TTS: texto -> WAV buffer
+ * Model: aura-asteria-es (español)
  */
-async function openaiTTS(text) {
-  const audio = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: "alloy",
-    format: "mp3",
-    input: text
-  });
-
-  const arrayBuf = await audio.arrayBuffer();
-  return Buffer.from(arrayBuf);
-}
-
-/*
-// (Opcional) ElevenLabs: lo dejamos por si luego vuelves
-async function elevenlabsTTS(text) {
-  const voiceId = process.env.ELEVENLABS_VOICE_ID;
-  const apiKey = process.env.ELEVENLABS_API_KEY;
-
-  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
-    method: "POST",
-    headers: {
-      "xi-api-key": apiKey,
-      "Content-Type": "application/json",
-      "Accept": "audio/mpeg"
-    },
-    body: JSON.stringify({
-      text,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: { stability: 0.4, similarity_boost: 0.75 }
-    })
-  });
+async function deepgramTTS(text) {
+  const resp = await fetch(
+    "https://api.deepgram.com/v1/speak?model=aura-asteria-es",
+    {
+      method: "POST",
+      headers: {
+        // Deepgram usa Token <key> (NO Bearer)
+        "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
+        "Content-Type": "application/json",
+        "Accept": "audio/wav"
+      },
+      body: JSON.stringify({ text })
+    }
+  );
 
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`ElevenLabs error ${resp.status}: ${errText}`);
+    const err = await resp.text().catch(() => "");
+    throw new Error(`Deepgram TTS error ${resp.status}: ${err}`);
   }
 
   const arrayBuf = await resp.arrayBuffer();
-  return Buffer.from(arrayBuf);
+  const buf = Buffer.from(arrayBuf);
+  if (buf.length < 200) throw new Error("Deepgram TTS returned too-small audio buffer");
+  return buf;
 }
-*/
 
-// mp3 -> mulaw 8k (raw) buffer usando ffmpeg
-async function mp3ToMulaw8kRaw(mp3Buffer) {
+// audio (wav/mp3/etc) -> mulaw 8k raw usando ffmpeg
+async function audioToMulaw8kRaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
       "-hide_banner",
@@ -82,7 +65,11 @@ async function mp3ToMulaw8kRaw(mp3Buffer) {
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(errChunks).toString("utf8")}`));
+        reject(
+          new Error(
+            `ffmpeg exit ${code}: ${Buffer.concat(errChunks).toString("utf8").slice(0, 400)}`
+          )
+        );
       } else {
         resolve(Buffer.concat(chunks));
       }
@@ -90,14 +77,14 @@ async function mp3ToMulaw8kRaw(mp3Buffer) {
 
     ff.on("error", reject);
 
-    ff.stdin.write(mp3Buffer);
+    ff.stdin.write(inputBuffer);
     ff.stdin.end();
   });
 }
 
 // Enviar audio a Twilio por WS en frames de 20ms (160 bytes @8kHz mulaw)
 async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
-  const FRAME_BYTES = 160; // 20ms
+  const FRAME_BYTES = 160; // 20ms @ 8kHz mulaw
   let offset = 0;
 
   while (offset < mulawRaw.length) {
@@ -105,11 +92,7 @@ async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
     offset += FRAME_BYTES;
 
     const payload = frame.toString("base64");
-    const msg = {
-      event: "media",
-      streamSid,
-      media: { payload }
-    };
+    const msg = { event: "media", streamSid, media: { payload } };
 
     if (twilioWs.readyState !== 1) break;
 
@@ -182,17 +165,9 @@ wss.on("connection", (twilioWs) => {
     vad_events: true
   });
 
-  dg.on(LiveTranscriptionEvents.Open, () => {
-    console.log("🟣 Deepgram Live conectado");
-  });
-
-  dg.on(LiveTranscriptionEvents.Error, (e) => {
-    console.log("💥 Deepgram error:", e?.message || e);
-  });
-
-  dg.on(LiveTranscriptionEvents.Close, () => {
-    console.log("🟣 Deepgram Live cerrado");
-  });
+  dg.on(LiveTranscriptionEvents.Open, () => console.log("🟣 Deepgram Live conectado"));
+  dg.on(LiveTranscriptionEvents.Error, (e) => console.log("💥 Deepgram error:", e?.message || e));
+  dg.on(LiveTranscriptionEvents.Close, () => console.log("🟣 Deepgram Live cerrado"));
 
   dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
     const alt = data.channel?.alternatives?.[0];
@@ -209,10 +184,9 @@ wss.on("connection", (twilioWs) => {
     const endOfUtterance =
       data.speech_final || (state.finalTextBuffer && now - state.lastFinalAt > 700);
 
+    // barge-in
     if (!data.is_final && state.isSpeaking && state.streamSid) {
-      try {
-        twilioWs.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
-      } catch {}
+      try { twilioWs.send(JSON.stringify({ event: "clear", streamSid: state.streamSid })); } catch {}
       state.isSpeaking = false;
     }
 
@@ -230,32 +204,21 @@ wss.on("connection", (twilioWs) => {
       const aiText = await getAIResponse(userUtterance, state);
       console.log("✅ OpenAI OK:", aiText);
 
-      // ✅ AQUÍ: OpenAI TTS en vez de ElevenLabs
-      console.log("➡️ Llamando a OpenAI TTS...");
-      const mp3 = await openaiTTS(aiText);
-      console.log("✅ OpenAI TTS OK, bytes:", mp3.length);
+      console.log("➡️ Llamando a Deepgram TTS...");
+      const wav = await deepgramTTS(aiText);
+      console.log("✅ Deepgram TTS OK, bytes:", wav.length);
 
       console.log("➡️ Transcodificando con ffmpeg...");
-      const mulaw = await mp3ToMulaw8kRaw(mp3);
+      const mulaw = await audioToMulaw8kRaw(wav);
       console.log("✅ ffmpeg OK, bytes:", mulaw.length);
 
       console.log("➡️ Enviando audio a Twilio...");
-      if (state.streamSid) {
-        await playMulawToTwilio({ twilioWs, streamSid: state.streamSid, mulawRaw: mulaw });
-        console.log("✅ Audio enviado a Twilio");
-      } else {
-        throw new Error("No streamSid disponible para reproducir audio");
-      }
+      if (!state.streamSid) throw new Error("No streamSid disponible para reproducir audio");
+      await playMulawToTwilio({ twilioWs, streamSid: state.streamSid, mulawRaw: mulaw });
+      console.log("✅ Audio enviado a Twilio");
     } catch (e) {
       console.log("💥 Error respondiendo (mensaje):", e?.message || e);
-
-      if (e?.cause) {
-        console.log("💥 Cause:", e.cause);
-      }
-
-      if (e?.stack) {
-        console.log("💥 Stack:", e.stack.split("\n").slice(0, 6).join("\n"));
-      }
+      if (e?.stack) console.log("💥 Stack:", e.stack.split("\n").slice(0, 6).join("\n"));
     } finally {
       state.isSpeaking = false;
     }
@@ -263,11 +226,7 @@ wss.on("connection", (twilioWs) => {
 
   twilioWs.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(msg.toString()); } catch { return; }
 
     if (data.event === "start") {
       state.streamSid = data?.start?.streamSid || null;
@@ -278,7 +237,6 @@ wss.on("connection", (twilioWs) => {
     if (data.event === "media") {
       const payload = data?.media?.payload;
       if (!payload) return;
-
       const audio = Buffer.from(payload, "base64");
       dg.send(audio);
       return;
@@ -296,11 +254,7 @@ wss.on("connection", (twilioWs) => {
     try { dg.finish(); } catch {}
   });
 
-  twilioWs.on("error", (err) => {
-    console.log("💥 WS error:", err?.message || err);
-  });
+  twilioWs.on("error", (err) => console.log("💥 WS error:", err?.message || err));
 });
 
-server.listen(PORT, () => {
-  console.log("✅ Server up on", PORT);
-});
+server.listen(PORT, () => console.log("✅ Server up on", PORT));
