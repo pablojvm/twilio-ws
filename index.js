@@ -124,7 +124,8 @@ function looksLikeEmptyReason(raw = "") {
 // ===== N8N POST =====
 async function postTicketToN8N(payload, { timeoutMs = 8000 } = {}) {
   const url = process.env.N8N_TICKET_WEBHOOK_URL;
-  if (!url) throw new Error("Falta N8N_TICKET_WEBHOOK_URL en variables de entorno");
+  if (!url)
+    throw new Error("Falta N8N_TICKET_WEBHOOK_URL en variables de entorno");
 
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -200,7 +201,11 @@ async function audioToMulaw8kRaw(inputBuffer) {
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`));
+        reject(
+          new Error(
+            `ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`
+          )
+        );
       } else {
         resolve(Buffer.concat(out));
       }
@@ -439,13 +444,112 @@ wss.on("connection", (ws) => {
         await speak(ws, state, aiText);
 
         // ===== N8N POST (enviar ticket 1 sola vez) =====
+        // ===== N8N POST (enviar ticket 1 sola vez) =====
         if (!state.ticketSent) {
           state.ticketSent = true;
+
+          // 1) Pedimos al modelo SOLO la clasificación (departamento + urgencia)
+          const classify = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            temperature: 0,
+            messages: [
+              {
+                role: "system",
+                content: `
+Eres un clasificador de incidencias de RRHH.
+Devuelve ÚNICAMENTE JSON válido, sin texto extra ni markdown.
+
+Departamentos posibles (elige 1):
+- nominas
+- contratacion
+- vacaciones_permisos
+- bajas_medicas
+- certificados
+- datos_personales
+- portal_empleado_acceso
+- it_soporte
+- otros_rrhh
+
+Urgencia (elige 1):
+- critica
+- alta
+- media
+- baja
+
+Reglas rápidas:
+- nómina/pago/retención/IRPF -> nominas
+- contrato/alta/fin/horario -> contratacion
+- vacaciones/permiso/días -> vacaciones_permisos
+- baja médica/parte/IT -> bajas_medicas
+- certificados/vida laboral/empresa -> certificados
+- cambio IBAN/dirección/datos -> datos_personales
+- no puedo entrar/contraseña/portal -> portal_empleado_acceso (o it_soporte si es técnico)
+- si no encaja -> otros_rrhh
+
+Devuelve:
+{"categoria":"...","urgencia":"..."}
+        `.trim(),
+              },
+              {
+                role: "user",
+                content: `Empleado: ${
+                  state.employeeIdOrName || "No identificado"
+                }\nTeléfono: ${state.callerPhone || "No informado"}\nMotivo: ${
+                  state.motivo || ""
+                }`,
+              },
+            ],
+          });
+
+          const raw = classify.choices?.[0]?.message?.content?.trim() || "{}";
+
+          // 2) Parse robusto (por si viniera con basura)
+          let parsed = {};
+          try {
+            const cleaned = raw
+              .replace(/^```json\s*/i, "")
+              .replace(/^```\s*/i, "")
+              .replace(/```$/i, "")
+              .trim();
+
+            const first = cleaned.indexOf("{");
+            const last = cleaned.lastIndexOf("}");
+            const jsonStr =
+              first !== -1 && last !== -1 && last > first
+                ? cleaned.slice(first, last + 1)
+                : cleaned;
+
+            parsed = JSON.parse(jsonStr);
+          } catch (e) {
+            parsed = {};
+          }
+
+          // 3) Normaliza y valida
+          const allowedCats = new Set([
+            "nominas",
+            "contratacion",
+            "vacaciones_permisos",
+            "bajas_medicas",
+            "certificados",
+            "datos_personales",
+            "portal_empleado_acceso",
+            "it_soporte",
+            "otros_rrhh",
+          ]);
+          const allowedUrg = new Set(["critica", "alta", "media", "baja"]);
+
+          const categoria = String(parsed.categoria || "")
+            .toLowerCase()
+            .trim();
+          const urgencia = String(parsed.urgencia || "")
+            .toLowerCase()
+            .trim();
+
           const payload = {
             nombre_completo: state.employeeIdOrName || "No identificado",
             telefono: state.callerPhone || "No informado",
-            categoria: "",
-            urgencia: "",
+            categoria: allowedCats.has(categoria) ? categoria : "otros_rrhh",
+            urgencia: allowedUrg.has(urgencia) ? urgencia : "media",
             mensaje_ia: state.motivo || "",
           };
 
@@ -479,12 +583,15 @@ wss.on("connection", (ws) => {
       console.log("📞 start:", state.streamSid);
 
       const cp = data.start?.customParameters || {};
-      state.callerPhone = cp.from || cp.caller || cp.telefono || data.start?.from || null;
+      state.callerPhone =
+        cp.from || cp.caller || cp.telefono || data.start?.from || null;
 
       if (state.callerPhone) {
         console.log("📱 callerPhone:", state.callerPhone);
       } else {
-        console.log("📱 callerPhone: (no recibido) — pásalo como <Parameter> en TwiML");
+        console.log(
+          "📱 callerPhone: (no recibido) — pásalo como <Parameter> en TwiML"
+        );
       }
 
       if (!state.greeted && state.streamSid) {
