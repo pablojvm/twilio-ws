@@ -14,6 +14,19 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 // ===== UTILS =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function looksLikeGoodbye(t = "") {
+  const s = t.toLowerCase();
+  return (
+    s.includes("adiós") ||
+    s.includes("adios") ||
+    s.includes("hasta luego") ||
+    s.includes("hasta pronto") ||
+    s.includes("gracias") ||
+    s.includes("vale gracias") ||
+    s.includes("ok gracias")
+  );
+}
+
 // ===== DEEPGRAM TTS (ESPAÑOL REAL) =====
 async function deepgramTTS(text) {
   const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-nestor-es";
@@ -61,7 +74,9 @@ async function audioToMulaw8kRaw(inputBuffer) {
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`));
+        reject(
+          new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`)
+        );
       } else {
         resolve(Buffer.concat(out));
       }
@@ -80,18 +95,29 @@ async function playMulawToTwilio({ ws, streamSid, mulaw }) {
 
   while (offset < mulaw.length) {
     if (ws.readyState !== 1) break;
+    if (!streamSid) break;
 
     const frame = mulaw.subarray(offset, offset + FRAME);
     offset += FRAME;
 
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: frame.toString("base64") },
-    }));
+    ws.send(
+      JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: frame.toString("base64") },
+      })
+    );
 
     await sleep(20);
   }
+}
+
+// ===== HABLAR (TTS + PLAY) =====
+async function speak(ws, state, text) {
+  if (!state.streamSid) return;
+  const wav = await deepgramTTS(text);
+  const mulaw = await audioToMulaw8kRaw(wav);
+  await playMulawToTwilio({ ws, streamSid: state.streamSid, mulaw });
 }
 
 // ===== OPENAI CHAT (VÍCTOR RRHH) =====
@@ -100,18 +126,21 @@ async function getAIResponse(userText, state) {
 Eres Víctor, agente de Recursos Humanos de Alerta y Control. Atiendes llamadas reales.
 Hablas en español (España), tono humano, cercano y profesional.
 
-Flujo (estricto):
-1) Identificación: si NO tenemos identificado al empleado, pide SOLO una vez: nombre completo o número de empleado.
-2) Motivo: cuando esté identificado, pide el motivo de la llamada (una sola pregunta).
-3) Tramitación: cuando tengas el motivo, NO preguntes más salvo que sea imprescindible. Crea la incidencia, clasifica y asigna departamento y prioridad.
-4) Cierre: SIEMPRE termina con una frase final exacta (adaptando el departamento):
-   "He creado la incidencia y la voy a mandar ahora mismo al departamento de {departamento}."
-
-Estilo:
-- Respuestas MUY cortas (1–2 frases).
+REGLA PRINCIPAL:
 - Máximo 1 pregunta por turno.
+- Respuestas cortas (1–2 frases).
 - No repitas lo que dice el usuario.
 - No menciones IA, modelos, OpenAI, Deepgram.
+
+ETAPAS (estricto):
+A) IDENTIFY: pedir nombre completo o número de empleado (solo eso).
+B) REASON: pedir el motivo (solo eso).
+C) DONE: cuando ya tienes motivo, crea incidencia, asigna departamento y prioridad, y CIERRA:
+   1) Confirmación de ticket (muy breve)
+   2) Frase final exacta:
+      "He creado la incidencia y la voy a mandar ahora mismo al departamento de {departamento}."
+   3) Despedida:
+      "Gracias por llamar. Cuando quieras, quedo a tu disposición. Hasta luego."
 
 Departamentos posibles (elige 1):
 - nominas
@@ -121,30 +150,31 @@ Departamentos posibles (elige 1):
 - certificados
 - datos_personales
 - portal_empleado_acceso
-- it_soporte (solo si es acceso/contraseña/portal)
+- it_soporte
 - otros_rrhh
 
 Prioridad:
-- critica: bloqueo total (no pueden operar / acceso crítico caído)
+- critica: bloqueo total
 - alta: nómina/baja con urgencia o plazo hoy
-- media: impacto normal (24–48h)
+- media: 24–48h
 - baja: consulta informativa
 
-Reglas de clasificación rápida:
+Clasificación rápida:
 - nómina/pago/retención/IRPF -> nominas
 - contrato/alta/fin/horario -> contratacion
 - vacaciones/permiso/días -> vacaciones_permisos
 - baja médica/parte/IT -> bajas_medicas
 - certificados/vida laboral/empresa -> certificados
-- cambio de IBAN/dirección/datos -> datos_personales
+- cambio IBAN/dirección/datos -> datos_personales
 - no puedo entrar/contraseña/portal -> portal_empleado_acceso (o it_soporte si es técnico)
 - si no encaja -> otros_rrhh
 `;
 
   const context = `
 Estado:
-- Identificado: ${state.employeeIdentified ? "sí" : "no"}
-- Nombre/ID empleado: ${state.employeeIdOrName || "no informado"}
+- etapa: ${state.stage}
+- empleado: ${state.employeeIdOrName || "no informado"}
+- motivo: ${state.motivo || "no"}
 `;
 
   const r = await openai.chat.completions.create({
@@ -183,9 +213,11 @@ wss.on("connection", (ws) => {
     buffer: "",
     lastFinal: 0,
 
-    // ✅ nuevos campos para identificación
-    employeeIdentified: false,
+    // estado callcenter
+    stage: "IDENTIFY", // IDENTIFY -> REASON -> DONE -> ACKED
     employeeIdOrName: null,
+    motivo: null,
+    ackedGoodbye: false,
   };
 
   const dg = deepgram.listen.live({
@@ -219,26 +251,60 @@ wss.on("connection", (ws) => {
 
     const userText = state.buffer;
     state.buffer = "";
+
+    // Si ya está DONE, NO volvemos a “gestionar” nada. Solo respondemos si el usuario se despide.
+    if (state.stage === "DONE") {
+      if (!state.ackedGoodbye && looksLikeGoodbye(userText)) {
+        state.ackedGoodbye = true;
+        state.speaking = true;
+        try {
+          await speak(ws, state, "Gracias, hasta luego.");
+        } catch (e) {
+          console.log("💥 Error despedida:", e?.message || e);
+        } finally {
+          state.speaking = false;
+        }
+      }
+      return; // se queda “esperando” (silencio)
+    }
+
     state.speaking = true;
 
     try {
       console.log("🧠 USUARIO:", userText);
 
-      // ✅ Heurística simple: si todavía no está identificado, guardamos lo que diga como id/nombre
-      // (Luego, cuando metas n8n/DB, aquí harás la consulta real)
-      if (!state.employeeIdentified) {
+      // ===== Máquina de estados =====
+      if (state.stage === "IDENTIFY") {
         state.employeeIdOrName = userText;
-        state.employeeIdentified = true;
+        state.stage = "REASON";
         console.log("🪪 Identificación capturada:", state.employeeIdOrName);
+
+        // Aquí NO usamos OpenAI: preguntamos directo (más natural y cero bucles)
+        const msg = `Perfecto, ${state.employeeIdOrName}. ¿Cuál es el motivo de tu llamada?`;
+        console.log("🤖 VÍCTOR:", msg);
+        await speak(ws, state, msg);
+        return;
       }
 
+      if (state.stage === "REASON") {
+        state.motivo = userText;
+        console.log("📝 Motivo capturado:", state.motivo);
+
+        // Ahora sí: OpenAI crea ticket + departamento + frase final + despedida
+        const aiText = await getAIResponse(userText, state);
+        console.log("🤖 VÍCTOR:", aiText);
+
+        await speak(ws, state, aiText);
+
+        // IMPORTANTE: pasamos a DONE para quedarnos en silencio después del cierre
+        state.stage = "DONE";
+        return;
+      }
+
+      // fallback (por si algo raro)
       const aiText = await getAIResponse(userText, state);
       console.log("🤖 VÍCTOR:", aiText);
-
-      const wav = await deepgramTTS(aiText);
-      const mulaw = await audioToMulaw8kRaw(wav);
-
-      await playMulawToTwilio({ ws, streamSid: state.streamSid, mulaw });
+      await speak(ws, state, aiText);
     } catch (e) {
       console.log("💥 Error:", e?.message || e);
     } finally {
@@ -253,7 +319,7 @@ wss.on("connection", (ws) => {
       state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
 
-      // ✅ Saludo inicial: pide identificación (nombre completo o nº empleado)
+      // ✅ Saludo inicial: pide identificación
       if (!state.greeted && state.streamSid) {
         state.greeted = true;
 
@@ -263,9 +329,7 @@ wss.on("connection", (ws) => {
         state.speaking = true;
         try {
           console.log("👋 SALUDO:", greeting);
-          const wav = await deepgramTTS(greeting);
-          const mulaw = await audioToMulaw8kRaw(wav);
-          await playMulawToTwilio({ ws, streamSid: state.streamSid, mulaw });
+          await speak(ws, state, greeting);
           console.log("✅ Saludo enviado");
         } catch (e) {
           console.log("💥 Error saludo:", e?.message || e);
@@ -273,15 +337,18 @@ wss.on("connection", (ws) => {
           state.speaking = false;
         }
       }
+      return;
     }
 
     if (data.event === "media") {
       dg.send(Buffer.from(data.media.payload, "base64"));
+      return;
     }
 
     if (data.event === "stop") {
       console.log("🔴 stop");
       dg.finish();
+      return;
     }
   });
 
