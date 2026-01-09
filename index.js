@@ -30,14 +30,12 @@ function looksLikeGoodbye(t = "") {
 function cleanEmployeeIdOrName(raw = "") {
   let s = raw.trim().replace(/\s+/g, " ");
 
-  // quita prefijos típicos
   s = s.replace(/^(yo\s+soy|soy|me\s+llamo|mi\s+nombre\s+es|nombre\s+es)\s+/i, "");
   s = s.replace(
     /^(n[uú]mero\s+de\s+empleado\s+es|n[uú]mero\s+empleado\s+es|mi\s+n[uú]mero\s+de\s+empleado\s+es)\s+/i,
     ""
   );
 
-  // quita signos al inicio/fin
   s = s.replace(/^[\s:,-]+/, "").replace(/[\s:,-]+$/, "");
 
   return s || raw.trim();
@@ -70,7 +68,35 @@ function looksLikeEmptyReason(raw = "") {
   return false;
 }
 
-// ===== DEEPGRAM TTS (ESPAÑOL REAL) =====
+// ===== N8N POST =====
+async function postTicketToN8N(payload, { timeoutMs = 8000 } = {}) {
+  const url = process.env.N8N_TICKET_WEBHOOK_URL;
+  if (!url) throw new Error("Falta N8N_TICKET_WEBHOOK_URL en variables de entorno");
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`POST n8n falló ${res.status} ${res.statusText}: ${txt}`);
+    }
+
+    // n8n suele devolver { ok: true }
+    return await res.json().catch(() => ({}));
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ===== DEEPGRAM TTS =====
 async function deepgramTTS(text) {
   const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-nestor-es";
 
@@ -136,7 +162,7 @@ async function audioToMulaw8kRaw(inputBuffer) {
 
 // ===== PLAY AUDIO A TWILIO =====
 async function playMulawToTwilio({ ws, streamSid, mulaw }) {
-  const FRAME = 160; // 20ms @ 8kHz
+  const FRAME = 160;
   let offset = 0;
 
   while (offset < mulaw.length) {
@@ -158,7 +184,7 @@ async function playMulawToTwilio({ ws, streamSid, mulaw }) {
   }
 }
 
-// ===== HABLAR (TTS + PLAY) =====
+// ===== HABLAR =====
 async function speak(ws, state, text) {
   if (!state.streamSid) return;
   const wav = await deepgramTTS(text);
@@ -166,7 +192,7 @@ async function speak(ws, state, text) {
   await playMulawToTwilio({ ws, streamSid: state.streamSid, mulaw });
 }
 
-// ===== OPENAI CHAT (VÍCTOR RRHH) =====
+// ===== OPENAI CHAT =====
 async function getAIResponse(userText, state) {
   const system = `
 Eres Víctor, agente de Recursos Humanos de Alerta y Control. Atiendes llamadas reales.
@@ -265,10 +291,14 @@ wss.on("connection", (ws) => {
     lastFinal: 0,
 
     // estado callcenter
-    stage: "IDENTIFY", // IDENTIFY -> REASON -> DONE
+    stage: "IDENTIFY",
     employeeIdOrName: null,
     motivo: null,
     ackedGoodbye: false,
+
+    // ===== N8N POST =====
+    callerPhone: null,
+    ticketSent: false,
   };
 
   const dg = deepgram.listen.live({
@@ -303,7 +333,6 @@ wss.on("connection", (ws) => {
     const userText = state.buffer;
     state.buffer = "";
 
-    // DONE: silencio, solo contestar una despedida si procede
     if (state.stage === "DONE") {
       if (!state.ackedGoodbye && looksLikeGoodbye(userText)) {
         state.ackedGoodbye = true;
@@ -324,7 +353,6 @@ wss.on("connection", (ws) => {
     try {
       console.log("🧠 USUARIO:", userText);
 
-      // ===== Máquina de estados =====
       if (state.stage === "IDENTIFY") {
         const clean = cleanEmployeeIdOrName(userText);
         state.employeeIdOrName = clean;
@@ -338,7 +366,6 @@ wss.on("connection", (ws) => {
       }
 
       if (state.stage === "REASON") {
-        // No aceptar motivos vacíos tipo “llamo porque”
         if (looksLikeEmptyReason(userText)) {
           const msg = "De acuerdo. Dime brevemente cuál es el problema.";
           console.log("🤖 VÍCTOR:", msg);
@@ -354,12 +381,29 @@ wss.on("connection", (ws) => {
 
         await speak(ws, state, aiText);
 
-        // ya cerró -> silencio
+        // ===== N8N POST (enviar ticket 1 sola vez) =====
+        if (!state.ticketSent) {
+          state.ticketSent = true;
+          const payload = {
+            nombre_completo: state.employeeIdOrName || "No identificado",
+            telefono: state.callerPhone || "No informado",
+            categoria: "",   // lo puede inferir n8n/OpenAI
+            urgencia: "",    // lo puede inferir n8n/OpenAI
+            mensaje_ia: state.motivo || "",
+          };
+
+          try {
+            const resp = await postTicketToN8N(payload);
+            console.log("✅ Ticket enviado a n8n:", resp);
+          } catch (e) {
+            console.log("💥 Error enviando ticket a n8n:", e?.message || e);
+          }
+        }
+
         state.stage = "DONE";
         return;
       }
 
-      // fallback
       const aiText = await getAIResponse(userText, state);
       console.log("🤖 VÍCTOR:", aiText);
       await speak(ws, state, aiText);
@@ -376,6 +420,17 @@ wss.on("connection", (ws) => {
     if (data.event === "start") {
       state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
+
+      // ===== N8N POST: capturar teléfono si Twilio lo manda como customParameters =====
+      const cp = data.start?.customParameters || {};
+      state.callerPhone =
+        cp.from || cp.caller || cp.telefono || data.start?.from || null;
+
+      if (state.callerPhone) {
+        console.log("📱 callerPhone:", state.callerPhone);
+      } else {
+        console.log("📱 callerPhone: (no recibido) — pásalo como <Parameter> en TwiML");
+      }
 
       if (!state.greeted && state.streamSid) {
         state.greeted = true;
