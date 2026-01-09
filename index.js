@@ -61,9 +61,7 @@ async function audioToMulaw8kRaw(inputBuffer) {
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(
-          new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`)
-        );
+        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`));
       } else {
         resolve(Buffer.concat(out));
       }
@@ -102,15 +100,18 @@ async function getAIResponse(userText, state) {
 Eres Víctor, agente de Recursos Humanos de Alerta y Control. Atiendes llamadas reales.
 Hablas en español (España), tono humano, cercano y profesional.
 
+Flujo (estricto):
+1) Identificación: si NO tenemos identificado al empleado, pide SOLO una vez: nombre completo o número de empleado.
+2) Motivo: cuando esté identificado, pide el motivo de la llamada (una sola pregunta).
+3) Tramitación: cuando tengas el motivo, NO preguntes más salvo que sea imprescindible. Crea la incidencia, clasifica y asigna departamento y prioridad.
+4) Cierre: SIEMPRE termina con una frase final exacta (adaptando el departamento):
+   "He creado la incidencia y la voy a mandar ahora mismo al departamento de {departamento}."
+
 Estilo:
 - Respuestas MUY cortas (1–2 frases).
-- Cero relleno. No repitas lo que dice el usuario.
-- Máximo 1 pregunta si falta un dato imprescindible.
-
-Objetivo:
-1) Entender el motivo de la llamada.
-2) Clasificar la incidencia y asignar departamento.
-3) Confirmar que has creado la incidencia y que la envías al departamento adecuado.
+- Máximo 1 pregunta por turno.
+- No repitas lo que dice el usuario.
+- No menciones IA, modelos, OpenAI, Deepgram.
 
 Departamentos posibles (elige 1):
 - nominas
@@ -124,34 +125,31 @@ Departamentos posibles (elige 1):
 - otros_rrhh
 
 Prioridad:
-- critica: bloqueo total / no pueden trabajar / caída total del servicio (si aplica a RRHH, “bloqueo total de nómina/portal”)
-- alta: afecta a nómina o baja médica con urgencia / plazo hoy
-- media: afecta pero puede esperar 24–48h
+- critica: bloqueo total (no pueden operar / acceso crítico caído)
+- alta: nómina/baja con urgencia o plazo hoy
+- media: impacto normal (24–48h)
 - baja: consulta informativa
 
-Reglas:
-- Si el motivo es claro (nómina, baja, vacaciones, contrato, certificado, cambio de datos, acceso al portal):
-  -> NO preguntes más: crea la incidencia, asigna departamento y prioridad, y confirma.
-- Si el motivo es vago:
-  -> Haz SOLO 1 pregunta: “¿Es sobre nómina, bajas, vacaciones, contrato, certificados, datos personales o acceso al portal?”
-- Si preguntan “¿me oyes?” o saludan:
-  -> “Sí, te escucho. Dime el motivo y lo gestiono ahora.”
-
-Formato de respuesta:
-- No digas que eres IA.
-- No menciones OpenAI/Deepgram/modelos.
-- Responde como humano.
+Reglas de clasificación rápida:
+- nómina/pago/retención/IRPF -> nominas
+- contrato/alta/fin/horario -> contratacion
+- vacaciones/permiso/días -> vacaciones_permisos
+- baja médica/parte/IT -> bajas_medicas
+- certificados/vida laboral/empresa -> certificados
+- cambio de IBAN/dirección/datos -> datos_personales
+- no puedo entrar/contraseña/portal -> portal_empleado_acceso (o it_soporte si es técnico)
+- si no encaja -> otros_rrhh
 `;
 
   const context = `
 Estado:
-- Empleado: ${state.employee || "no identificado"}
-- Empresa: ${state.company || "desconocida"}
+- Identificado: ${state.employeeIdentified ? "sí" : "no"}
+- Nombre/ID empleado: ${state.employeeIdOrName || "no informado"}
 `;
 
   const r = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    temperature: 0.3,
+    temperature: 0.2,
     messages: [
       { role: "system", content: system },
       { role: "system", content: context },
@@ -184,8 +182,10 @@ wss.on("connection", (ws) => {
     greeted: false,
     buffer: "",
     lastFinal: 0,
-    employee: null,
-    company: null,
+
+    // ✅ nuevos campos para identificación
+    employeeIdentified: false,
+    employeeIdOrName: null,
   };
 
   const dg = deepgram.listen.live({
@@ -223,6 +223,15 @@ wss.on("connection", (ws) => {
 
     try {
       console.log("🧠 USUARIO:", userText);
+
+      // ✅ Heurística simple: si todavía no está identificado, guardamos lo que diga como id/nombre
+      // (Luego, cuando metas n8n/DB, aquí harás la consulta real)
+      if (!state.employeeIdentified) {
+        state.employeeIdOrName = userText;
+        state.employeeIdentified = true;
+        console.log("🪪 Identificación capturada:", state.employeeIdOrName);
+      }
+
       const aiText = await getAIResponse(userText, state);
       console.log("🤖 VÍCTOR:", aiText);
 
@@ -244,14 +253,13 @@ wss.on("connection", (ws) => {
       state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
 
-      // ✅ Saludo inicial: empieza hablando él
+      // ✅ Saludo inicial: pide identificación (nombre completo o nº empleado)
       if (!state.greeted && state.streamSid) {
         state.greeted = true;
 
         const greeting =
-          "Buenos días, soy Víctor, agente de Recursos Humanos. Dime el motivo de tu llamada y lo gestiono ahora mismo.";
+          "Buenos días, soy Víctor, agente de Recursos Humanos. Antes de nada, dime tu nombre completo o tu número de empleado para identificarte.";
 
-        // Marcamos speaking para que no responda a STT mientras suena el saludo
         state.speaking = true;
         try {
           console.log("👋 SALUDO:", greeting);
