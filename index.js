@@ -7,24 +7,22 @@ import { spawn } from "child_process";
 
 const PORT = process.env.PORT || 3000;
 
+// ===== CLIENTES =====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// ===== UTILS =====
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * ✅ Deepgram TTS: texto -> WAV buffer
- * Model: aura-asteria-es (español)
- */
+// ===== DEEPGRAM TTS (ESPAÑOL REAL) =====
 async function deepgramTTS(text) {
+  const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-nestor-es";
+
   const resp = await fetch(
-    "https://api.deepgram.com/v1/speak?model=aura-asteria-es",
+    `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(model)}`,
     {
       method: "POST",
       headers: {
-        // Deepgram usa Token <key> (NO Bearer)
         "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
         "Content-Type": "application/json",
         "Accept": "audio/wav"
@@ -39,12 +37,10 @@ async function deepgramTTS(text) {
   }
 
   const arrayBuf = await resp.arrayBuffer();
-  const buf = Buffer.from(arrayBuf);
-  if (buf.length < 200) throw new Error("Deepgram TTS returned too-small audio buffer");
-  return buf;
+  return Buffer.from(arrayBuf);
 }
 
-// audio (wav/mp3/etc) -> mulaw 8k raw usando ffmpeg
+// ===== AUDIO → MULAW 8K =====
 async function audioToMulaw8kRaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
@@ -57,65 +53,64 @@ async function audioToMulaw8kRaw(inputBuffer) {
       "pipe:1"
     ]);
 
-    const chunks = [];
-    const errChunks = [];
+    const out = [];
+    const err = [];
 
-    ff.stdout.on("data", (d) => chunks.push(d));
-    ff.stderr.on("data", (d) => errChunks.push(d));
+    ff.stdout.on("data", (d) => out.push(d));
+    ff.stderr.on("data", (d) => err.push(d));
 
     ff.on("close", (code) => {
       if (code !== 0) {
-        reject(
-          new Error(
-            `ffmpeg exit ${code}: ${Buffer.concat(errChunks).toString("utf8").slice(0, 400)}`
-          )
-        );
+        reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString("utf8")}`));
       } else {
-        resolve(Buffer.concat(chunks));
+        resolve(Buffer.concat(out));
       }
     });
 
     ff.on("error", reject);
-
     ff.stdin.write(inputBuffer);
     ff.stdin.end();
   });
 }
 
-// Enviar audio a Twilio por WS en frames de 20ms (160 bytes @8kHz mulaw)
-async function playMulawToTwilio({ twilioWs, streamSid, mulawRaw }) {
-  const FRAME_BYTES = 160; // 20ms @ 8kHz mulaw
+// ===== PLAY AUDIO A TWILIO =====
+async function playMulawToTwilio({ ws, streamSid, mulaw }) {
+  const FRAME = 160; // 20ms @ 8kHz
   let offset = 0;
 
-  while (offset < mulawRaw.length) {
-    const frame = mulawRaw.subarray(offset, offset + FRAME_BYTES);
-    offset += FRAME_BYTES;
+  while (offset < mulaw.length) {
+    if (ws.readyState !== 1) break;
 
-    const payload = frame.toString("base64");
-    const msg = { event: "media", streamSid, media: { payload } };
+    const frame = mulaw.subarray(offset, offset + FRAME);
+    offset += FRAME;
 
-    if (twilioWs.readyState !== 1) break;
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: frame.toString("base64") }
+    }));
 
-    twilioWs.send(JSON.stringify(msg));
     await sleep(20);
   }
 }
 
-// OpenAI: texto usuario -> texto respuesta
+// ===== OPENAI CHAT =====
 async function getAIResponse(userText, state) {
-  const system = `Eres Lucía, agente de soporte telefónico de Alerta y Control.
-Hablas en español, frases cortas, tono humano y profesional.
-Haz 1 pregunta por turno.
-Si falta información, pregunta.
-Si es incidencia crítica, actúa con urgencia.
-No digas que eres IA.`;
+  const system = `
+Eres Lucía, agente de soporte telefónico.
+Hablas español, tono humano y profesional.
+Frases cortas. Una pregunta por turno.
+Si es urgente, actúa como emergencia.
+Nunca digas que eres IA.
+`;
 
-  const context = `Estado:
-- Empleado: ${state.employeeName || "no identificado"}
+  const context = `
+Estado:
+- Empleado: ${state.employee || "no identificado"}
 - Empresa: ${state.company || "desconocida"}
 `;
 
-  const resp = await openai.chat.completions.create({
+  const r = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.3,
     messages: [
@@ -125,10 +120,11 @@ No digas que eres IA.`;
     ]
   });
 
-  return resp.choices?.[0]?.message?.content?.trim() || "Perdona, ¿me lo repites?";
+  return r.choices[0].message.content.trim();
 }
 
-const server = http.createServer((req, res) => {
+// ===== HTTP + WS =====
+const server = http.createServer((_, res) => {
   res.writeHead(200);
   res.end("OK");
 });
@@ -136,125 +132,100 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url !== "/ws-media") {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  if (req.url !== "/ws-media") return socket.destroy();
+  wss.handleUpgrade(req, socket, head, (ws) =>
+    wss.emit("connection", ws)
+  );
 });
 
-wss.on("connection", (twilioWs) => {
-  console.log("🟢 Twilio conectado en /ws-media");
+wss.on("connection", (ws) => {
+  console.log("🟢 Twilio conectado");
 
   const state = {
     streamSid: null,
-    isSpeaking: false,
-    finalTextBuffer: "",
-    lastFinalAt: 0
+    speaking: false,
+    buffer: "",
+    lastFinal: 0
   };
 
   const dg = deepgram.listen.live({
     model: "nova-2",
     language: "es",
-    smart_format: true,
     encoding: "mulaw",
     sample_rate: 8000,
-    channels: 1,
     interim_results: true,
     endpointing: 200,
     vad_events: true
   });
 
-  dg.on(LiveTranscriptionEvents.Open, () => console.log("🟣 Deepgram Live conectado"));
-  dg.on(LiveTranscriptionEvents.Error, (e) => console.log("💥 Deepgram error:", e?.message || e));
-  dg.on(LiveTranscriptionEvents.Close, () => console.log("🟣 Deepgram Live cerrado"));
+  dg.on(LiveTranscriptionEvents.Open, () =>
+    console.log("🟣 Deepgram STT conectado")
+  );
 
   dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
-    const alt = data.channel?.alternatives?.[0];
-    const text = (alt?.transcript || "").trim();
+    const text = data.channel?.alternatives?.[0]?.transcript?.trim();
     if (!text) return;
 
     if (data.is_final) {
-      state.finalTextBuffer += (state.finalTextBuffer ? " " : "") + text;
-      state.lastFinalAt = Date.now();
+      state.buffer += (state.buffer ? " " : "") + text;
+      state.lastFinal = Date.now();
       console.log("✅ FINAL:", text);
     }
 
-    const now = Date.now();
-    const endOfUtterance =
-      data.speech_final || (state.finalTextBuffer && now - state.lastFinalAt > 700);
+    const end =
+      data.speech_final ||
+      (state.buffer && Date.now() - state.lastFinal > 700);
 
-    // barge-in
-    if (!data.is_final && state.isSpeaking && state.streamSid) {
-      try { twilioWs.send(JSON.stringify({ event: "clear", streamSid: state.streamSid })); } catch {}
-      state.isSpeaking = false;
-    }
+    if (!end || state.speaking) return;
 
-    if (!endOfUtterance || !state.finalTextBuffer) return;
-
-    const userUtterance = state.finalTextBuffer;
-    state.finalTextBuffer = "";
-    console.log("🧠 TURNO USUARIO:", userUtterance);
-
-    if (state.isSpeaking) return;
-    state.isSpeaking = true;
+    const userText = state.buffer;
+    state.buffer = "";
+    state.speaking = true;
 
     try {
-      console.log("➡️ Llamando a OpenAI...");
-      const aiText = await getAIResponse(userUtterance, state);
-      console.log("✅ OpenAI OK:", aiText);
+      console.log("🧠 USUARIO:", userText);
+      const aiText = await getAIResponse(userText, state);
+      console.log("🤖 LUCÍA:", aiText);
 
-      console.log("➡️ Llamando a Deepgram TTS...");
       const wav = await deepgramTTS(aiText);
-      console.log("✅ Deepgram TTS OK, bytes:", wav.length);
-
-      console.log("➡️ Transcodificando con ffmpeg...");
       const mulaw = await audioToMulaw8kRaw(wav);
-      console.log("✅ ffmpeg OK, bytes:", mulaw.length);
 
-      console.log("➡️ Enviando audio a Twilio...");
-      if (!state.streamSid) throw new Error("No streamSid disponible para reproducir audio");
-      await playMulawToTwilio({ twilioWs, streamSid: state.streamSid, mulawRaw: mulaw });
-      console.log("✅ Audio enviado a Twilio");
+      await playMulawToTwilio({
+        ws,
+        streamSid: state.streamSid,
+        mulaw
+      });
     } catch (e) {
-      console.log("💥 Error respondiendo (mensaje):", e?.message || e);
-      if (e?.stack) console.log("💥 Stack:", e.stack.split("\n").slice(0, 6).join("\n"));
+      console.log("💥 Error:", e.message);
     } finally {
-      state.isSpeaking = false;
+      state.speaking = false;
     }
   });
 
-  twilioWs.on("message", (msg) => {
-    let data;
-    try { data = JSON.parse(msg.toString()); } catch { return; }
+  ws.on("message", (msg) => {
+    const data = JSON.parse(msg.toString());
 
     if (data.event === "start") {
-      state.streamSid = data?.start?.streamSid || null;
+      state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
-      return;
     }
 
     if (data.event === "media") {
-      const payload = data?.media?.payload;
-      if (!payload) return;
-      const audio = Buffer.from(payload, "base64");
-      dg.send(audio);
-      return;
+      dg.send(Buffer.from(data.media.payload, "base64"));
     }
 
     if (data.event === "stop") {
       console.log("🔴 stop");
-      try { dg.finish(); } catch {}
-      return;
+      dg.finish();
     }
   });
 
-  twilioWs.on("close", () => {
+  ws.on("close", () => {
     console.log("❌ WS cerrado");
-    try { dg.finish(); } catch {}
+    dg.finish();
   });
-
-  twilioWs.on("error", (err) => console.log("💥 WS error:", err?.message || err));
 });
 
-server.listen(PORT, () => console.log("✅ Server up on", PORT));
+server.listen(PORT, () =>
+  console.log("✅ Server up on", PORT)
+);
