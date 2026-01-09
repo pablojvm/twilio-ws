@@ -28,17 +28,70 @@ function looksLikeGoodbye(t = "") {
 }
 
 function cleanEmployeeIdOrName(raw = "") {
-  let s = raw.trim().replace(/\s+/g, " ");
+  if (!raw) return "";
 
-  s = s.replace(/^(yo\s+soy|soy|me\s+llamo|mi\s+nombre\s+es|nombre\s+es)\s+/i, "");
+  let s = String(raw).trim().replace(/\s+/g, " ");
+
+  // 1) Quitar muletillas/saludos al inicio
   s = s.replace(
-    /^(n[uú]mero\s+de\s+empleado\s+es|n[uú]mero\s+empleado\s+es|mi\s+n[uú]mero\s+de\s+empleado\s+es)\s+/i,
+    /^(?:hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|oye|eh|vale|mira|a\s+ver|pues|bueno)\b[\s,.-]*/i,
     ""
   );
 
-  s = s.replace(/^[\s:,-]+/, "").replace(/[\s:,-]+$/, "");
+  // 2) Quitar fórmulas de presentación
+  s = s.replace(
+    /^(?:(?:hola\s*,?\s*)?(?:yo\s+)?soy|me\s+llamo|mi\s+nombre\s+es|nombre\s+es|le\s+habla|habla|te\s+habla)\b[\s:,-]*/i,
+    ""
+  );
 
-  return s || raw.trim();
+  // 3) Quitar "soy el/la"
+  s = s.replace(/^(?:soy\s+(?:el|la))\b[\s:,-]*/i, "");
+
+  // 4) Quitar prefijos de identificación de empleado
+  s = s.replace(
+    /^(?:(?:mi\s+)?n[uú]mero\s+(?:de\s+)?empleado\s*(?:es|:)?|n[uú]mero\s+empleado\s*(?:es|:)?|id\s*(?:de\s+)?empleado\s*(?:es|:)?|identificador\s*(?:de\s+)?empleado\s*(?:es|:)?|c[oó]digo\s*(?:de\s+)?empleado\s*(?:es|:)?|legajo\s*(?:es|:)?|matr[ií]cula\s*(?:es|:)?)\s*/i,
+    ""
+  );
+
+  // 5) Si empieza por "es ..."
+  s = s.replace(/^(?:es)\b[\s:,-]*/i, "");
+
+  // 6) Quitar comillas/puntuación sobrante
+  s = s
+    .replace(/^[\s"'“”‘’()[\]{}:,-]+/, "")
+    .replace(/[\s"'“”‘’()[\]{}:,-]+$/, "");
+
+  // 7) Re-limpiar muletilla
+  s = s.replace(
+    /^(?:hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|oye|eh|vale|mira|a\s+ver|pues|bueno)\b[\s,.-]*/i,
+    ""
+  );
+
+  // 8) Normalizar espacios
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s || String(raw).trim();
+}
+
+// ✅ NUEVO: Solo para hablarle por su nombre (primer nombre), sin apellidos
+function firstNameForGreeting(full = "") {
+  let s = String(full).trim().replace(/\s+/g, " ");
+  if (!s) return "";
+
+  // Quitar tratamientos típicos
+  s = s.replace(/^(sr\.?|sra\.?|señor|señora|don|doña)\s+/i, "");
+
+  const parts = s.split(" ").filter(Boolean);
+
+  // Si es solo un número (nº empleado), no lo digas en voz
+  if (parts.length === 1 && /^\d{3,}$/.test(parts[0])) return "";
+
+  // Si empieza con números, busca la primera palabra no numérica
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) return p;
+  }
+
+  return parts[0] || "";
 }
 
 function looksLikeEmptyReason(raw = "") {
@@ -89,7 +142,6 @@ async function postTicketToN8N(payload, { timeoutMs = 8000 } = {}) {
       throw new Error(`POST n8n falló ${res.status} ${res.statusText}: ${txt}`);
     }
 
-    // n8n suele devolver { ok: true }
     return await res.json().catch(() => ({}));
   } finally {
     clearTimeout(t);
@@ -359,7 +411,12 @@ wss.on("connection", (ws) => {
         state.stage = "REASON";
         console.log("🪪 Identificación capturada:", state.employeeIdOrName);
 
-        const msg = `Perfecto, ${state.employeeIdOrName}. ¿Cuál es el motivo de tu llamada?`;
+        // ✅ AQUÍ el cambio: saludar solo con el primer nombre (si es nombre)
+        const firstName = firstNameForGreeting(state.employeeIdOrName);
+        const msg = firstName
+          ? `Perfecto, ${firstName}. ¿Cuál es el motivo de tu llamada?`
+          : "Perfecto. ¿Cuál es el motivo de tu llamada?";
+
         console.log("🤖 VÍCTOR:", msg);
         await speak(ws, state, msg);
         return;
@@ -387,8 +444,8 @@ wss.on("connection", (ws) => {
           const payload = {
             nombre_completo: state.employeeIdOrName || "No identificado",
             telefono: state.callerPhone || "No informado",
-            categoria: "",   // lo puede inferir n8n/OpenAI
-            urgencia: "",    // lo puede inferir n8n/OpenAI
+            categoria: "",
+            urgencia: "",
             mensaje_ia: state.motivo || "",
           };
 
@@ -421,10 +478,8 @@ wss.on("connection", (ws) => {
       state.streamSid = data.start.streamSid;
       console.log("📞 start:", state.streamSid);
 
-      // ===== N8N POST: capturar teléfono si Twilio lo manda como customParameters =====
       const cp = data.start?.customParameters || {};
-      state.callerPhone =
-        cp.from || cp.caller || cp.telefono || data.start?.from || null;
+      state.callerPhone = cp.from || cp.caller || cp.telefono || data.start?.from || null;
 
       if (state.callerPhone) {
         console.log("📱 callerPhone:", state.callerPhone);
